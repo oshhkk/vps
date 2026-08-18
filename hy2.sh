@@ -1,381 +1,229 @@
-#!/usr/bin/env bash
-# -*- coding: utf-8 -*-
-
-# Hysteria 2 v2.11.0
-# Cloudflare DNS-01 ACME + systemd
-#
-# 用法：
-#   bash install-hy2.sh <域名> <邮箱> [端口]
-#
-# 示例：
-#   bash install-hy2.sh hy2.example.com you@example.com 443
 
 set -euo pipefail
 
-# ============================================================
-# 基本配置
-# ============================================================
+# ---------- 默认配置 ----------
+HYSTERIA_VERSION="v2.9.2"      # 2026-05-23 发布；建议定期到 release 页确认是否有更新
+DEFAULT_PORT=22222
+CERT_FILE="cert.pem"
+KEY_FILE="key.pem"
+PASSWORD_FILE="auth.pass"
+SNI="www.bing.com"
+ALPN="h3"
+MEMORY_LIMIT="${GOMEMLIMIT:-70MiB}"   # Go 运行时软内存上限；100MB 总预算里给系统/其他进程留出余量
+# ------------------------------
 
-HYSTERIA_VERSION="v2.11.0"
+echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+echo "Hysteria2 极简部署脚本（Shell 版 · 低内存优化，目标 <100MB）"
+echo "支持命令行端口参数，如：bash hysteria2.sh 443"
+echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 
-DOMAIN="${1:-}"
-EMAIL="${2:-}"
-SERVER_PORT="${3:-443}"
-
-INSTALL_DIR="/opt/hysteria"
-CONFIG_DIR="/etc/hysteria"
-CONFIG_FILE="${CONFIG_DIR}/config.yaml"
-SERVICE_FILE="/etc/systemd/system/hysteria-server.service"
-
-HYSTERIA_USER="hysteria"
-HYSTERIA_GROUP="hysteria"
-
-# ============================================================
-# 检查参数
-# ============================================================
-
-if [[ -z "$DOMAIN" || -z "$EMAIL" ]]; then
-    echo "用法："
-    echo "  bash $0 <域名> <邮箱> [端口]"
-    echo
-    echo "示例："
-    echo "  bash $0 hy2.example.com you@example.com 443"
-    exit 1
+# ---------- 获取端口 ----------
+if [[ $# -ge 1 && -n "${1:-}" ]]; then
+    SERVER_PORT="$1"
+    echo "✅ 使用命令行指定端口: $SERVER_PORT"
+else
+    SERVER_PORT="${SERVER_PORT:-$DEFAULT_PORT}"
+    echo "⚙️ 未提供端口参数，使用默认端口: $SERVER_PORT"
 fi
 
-if ! [[ "$SERVER_PORT" =~ ^[0-9]+$ ]] || \
-   (( SERVER_PORT < 1 || SERVER_PORT > 65535 )); then
-    echo "❌ 端口无效：$SERVER_PORT"
-    exit 1
+# ---------- 密码：环境变量 > 已保存的密码 > 自动生成 ----------
+if [[ -n "${AUTH_PASSWORD:-}" ]]; then
+    echo "✅ 使用环境变量指定的密码"
+elif [[ -f "$PASSWORD_FILE" ]]; then
+    AUTH_PASSWORD=$(cat "$PASSWORD_FILE")
+    echo "✅ 检测到已保存的密码（$PASSWORD_FILE），复用它以免重复运行时密码跟着变"
+else
+    AUTH_PASSWORD=$(openssl rand -hex 16)   # hex 而非 base64：避免 +/= 之类的字符把下面的 hysteria2:// 分享链接解析错乱
+    echo "$AUTH_PASSWORD" > "$PASSWORD_FILE"
+    chmod 600 "$PASSWORD_FILE"
+    echo "🔑 已自动生成随机密码并保存到 $PASSWORD_FILE（想固定密码可 export AUTH_PASSWORD=xxx 后再运行）"
 fi
 
-if [[ $EUID -ne 0 ]]; then
-    echo "❌ 请使用 root 用户执行。"
-    exit 1
+# ---------- 检测架构 ----------
+arch_name() {
+    local machine
+    machine=$(uname -m | tr '[:upper:]' '[:lower:]')
+    case "$machine" in
+        x86_64|amd64)        echo "amd64" ;;
+        aarch64|arm64)       echo "arm64" ;;
+        armv7*)              echo "arm" ;;      # 尽力而为
+        armv6*|armv5*|arm*)  echo "armv5" ;;     # 尽力而为，老旧/低端设备兜底
+        i386|i686|x86)       echo "386" ;;
+        mipsel|mipsle)       echo "mipsle" ;;
+        riscv64)             echo "riscv64" ;;
+        s390x)                echo "s390x" ;;
+        *)                    echo "" ;;
+    esac
+}
+
+ARCH="${BIN_ARCH_OVERRIDE:-$(arch_name)}"
+if [ -z "$ARCH" ]; then
+  echo "❌ 无法识别 CPU 架构: $(uname -m)"
+  echo "   可手动指定，例如: BIN_ARCH_OVERRIDE=amd64 bash hysteria2.sh"
+  exit 1
 fi
 
-# ============================================================
-# 获取 Cloudflare API Token
-# ============================================================
+BIN_NAME="hysteria-linux-${ARCH}"
+BIN_PATH="./${BIN_NAME}"
 
-echo
-echo "============================================================"
-echo "Cloudflare API Token"
-echo "============================================================"
-echo
-echo "请输入 Cloudflare API Token。"
-echo "输入时不会显示在屏幕上。"
-echo
-
-read -r -s -p "Cloudflare API Token: " CF_API_TOKEN
-echo
-
-if [[ -z "$CF_API_TOKEN" ]]; then
-    echo "❌ Cloudflare API Token 不能为空。"
-    exit 1
-fi
-
-# ============================================================
-# 生成随机密码
-# ============================================================
-
-AUTH_PASSWORD="$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 32)"
-
-if [[ -z "$AUTH_PASSWORD" ]]; then
-    echo "❌ 无法生成随机密码。"
-    exit 1
-fi
-
-# ============================================================
-# 检查依赖
-# ============================================================
-
-echo
-echo "============================================================"
-echo "检查系统环境"
-echo "============================================================"
-
-for cmd in curl bash systemctl openssl uname; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        echo "❌ 缺少依赖：$cmd"
+# ---------- 校验和验证 ----------
+verify_checksum() {
+    local hash_url="https://github.com/apernet/hysteria/releases/download/app/${HYSTERIA_VERSION}/hashes.txt"
+    local hashes expected actual
+    if ! hashes=$(curl -fsL --connect-timeout 10 --max-time 20 "$hash_url" 2>/dev/null); then
+        echo "⚠️ 未能获取官方 hashes.txt，跳过完整性校验（不影响运行，建议之后手动核对一下）。"
+        return
+    fi
+    expected=$(printf '%s\n' "$hashes" | grep -E "[[:space:]]${BIN_NAME}\$" | awk '{print $1}' | head -n1)
+    if [[ -z "$expected" ]]; then
+        echo "⚠️ hashes.txt 里没找到 ${BIN_NAME} 对应条目，跳过校验。"
+        return
+    fi
+    actual=$(sha256sum "$BIN_PATH" | awk '{print $1}')
+    if [[ "$expected" == "$actual" ]]; then
+        echo "✅ SHA256 校验通过，二进制完整可信。"
+    else
+        echo "❌ SHA256 校验不匹配！期望 $expected，实际 $actual"
+        echo "❌ 文件可能损坏或被篡改，已删除并退出。"
+        rm -f "$BIN_PATH"
         exit 1
     fi
-done
+}
 
-echo "✅ 基础依赖检查完成"
-
-# ============================================================
-# 检测 CPU 架构
-# ============================================================
-
-MACHINE="$(uname -m)"
-
-case "$MACHINE" in
-    x86_64|amd64)
-        ARCH="amd64"
-        ;;
-    aarch64|arm64)
-        ARCH="arm64"
-        ;;
-    *)
-        echo "❌ 暂不支持的 CPU 架构：$MACHINE"
+# ---------- 下载二进制 ----------
+download_binary() {
+    if [ -f "$BIN_PATH" ]; then
+        echo "✅ 二进制已存在，跳过下载。"
+        return
+    fi
+    local url="https://github.com/apernet/hysteria/releases/download/app/${HYSTERIA_VERSION}/${BIN_NAME}"
+    echo "⏳ 下载: $url"
+    if ! curl -fL --retry 3 --connect-timeout 30 -o "$BIN_PATH" "$url"; then
+        echo "❌ 下载失败，请确认版本号/架构名正确，且网络能访问 GitHub。"
+        rm -f "$BIN_PATH"
         exit 1
-        ;;
-esac
+    fi
+    chmod +x "$BIN_PATH"
+    echo "✅ 下载完成并设置可执行: $BIN_PATH"
+    verify_checksum
+}
 
-BINARY_NAME="hysteria-linux-${ARCH}"
-BINARY_PATH="${INSTALL_DIR}/hysteria"
+# ---------- 生成证书 ----------
+ensure_cert() {
+    if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
+        echo "✅ 发现证书，使用现有 cert/key。"
+        return
+    fi
+    echo "🔑 未发现证书，使用 openssl 生成自签证书（prime256v1）..."
+    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -days 3650 -keyout "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=${SNI}"
+    chmod 600 "$KEY_FILE"
+    echo "✅ 证书生成成功。"
+}
 
-echo "✅ CPU 架构：$ARCH"
-
-# ============================================================
-# 创建用户和目录
-# ============================================================
-
-echo
-echo "============================================================"
-echo "创建 Hysteria 用户和目录"
-echo "============================================================"
-
-if ! getent group "$HYSTERIA_GROUP" >/dev/null 2>&1; then
-    groupadd --system "$HYSTERIA_GROUP"
-fi
-
-if ! id "$HYSTERIA_USER" >/dev/null 2>&1; then
-    useradd \
-        --system \
-        --gid "$HYSTERIA_GROUP" \
-        --no-create-home \
-        --home-dir /nonexistent \
-        --shell /usr/sbin/nologin \
-        "$HYSTERIA_USER"
-fi
-
-mkdir -p "$INSTALL_DIR"
-mkdir -p "$CONFIG_DIR"
-
-chown root:root "$INSTALL_DIR"
-chmod 755 "$INSTALL_DIR"
-
-chown root:"$HYSTERIA_GROUP" "$CONFIG_DIR"
-chmod 750 "$CONFIG_DIR"
-
-# ============================================================
-# 下载 Hysteria
-# ============================================================
-
-echo
-echo "============================================================"
-echo "下载 Hysteria ${HYSTERIA_VERSION}"
-echo "============================================================"
-
-DOWNLOAD_URL="https://github.com/apernet/hysteria/releases/download/app/${HYSTERIA_VERSION}/${BINARY_NAME}"
-
-echo "下载地址："
-echo "$DOWNLOAD_URL"
-echo
-
-curl -fL \
-    --retry 3 \
-    --connect-timeout 30 \
-    -o "$BINARY_PATH" \
-    "$DOWNLOAD_URL"
-
-chmod 755 "$BINARY_PATH"
-chown root:root "$BINARY_PATH"
-
-echo
-echo "✅ Hysteria 下载完成"
-
-# ============================================================
-# 检查版本
-# ============================================================
-
-echo
-echo "============================================================"
-echo "检查 Hysteria 版本"
-echo "============================================================"
-
-"$BINARY_PATH" version || true
-
-# ============================================================
-# 写入配置
-# ============================================================
-
-echo
-echo "============================================================"
-echo "生成 Hysteria 配置"
-echo "============================================================"
-
-cat > "$CONFIG_FILE" <<EOF
+# ---------- 写配置文件 ----------
+write_config() {
+cat > server.yaml <<EOF
 listen: ":${SERVER_PORT}"
-
-acme:
-  domains:
-    - "${DOMAIN}"
-  email: "${EMAIL}"
-  type: dns
-  dns:
-    name: cloudflare
-    config:
-      cloudflare_api_token: "${CF_API_TOKEN}"
-
+tls:
+  cert: "$(pwd)/${CERT_FILE}"
+  key: "$(pwd)/${KEY_FILE}"
+  alpn:
+    - "${ALPN}"
 auth:
-  type: password
+  type: "password"
   password: "${AUTH_PASSWORD}"
-
 bandwidth:
   up: "200mbps"
   down: "200mbps"
+quic:
+  maxIdleTimeout: 10s
+  maxIncomingStreams: 32
+  initStreamReceiveWindow: 131072
+  maxStreamReceiveWindow: 262144
+  initConnReceiveWindow: 327680
+  maxConnReceiveWindow: 655360
 EOF
+    echo "✅ 写入配置 server.yaml（端口=${SERVER_PORT}, SNI=${SNI}, ALPN=${ALPN}）。"
+}
 
-chown root:"$HYSTERIA_GROUP" "$CONFIG_FILE"
-chmod 640 "$CONFIG_FILE"
+# ---------- 获取服务器 IP ----------
+get_server_ip() {
+    local ip
+    ip=$(curl -fsL --max-time 8 https://api.ipify.org 2>/dev/null) \
+        || ip=$(curl -fsL --max-time 8 https://ifconfig.me 2>/dev/null) \
+        || ip="YOUR_SERVER_IP"
+    echo "$ip"
+}
 
-echo "✅ 配置文件：$CONFIG_FILE"
-
-# ============================================================
-# 创建 systemd 服务
-# ============================================================
-
-echo
-echo "============================================================"
-echo "创建 systemd 服务"
-echo "============================================================"
-
-cat > "$SERVICE_FILE" <<EOF
+# ---------- 生成可选的 systemd 单元文件（不会自动安装/启用） ----------
+write_systemd_unit() {
+    local workdir
+    workdir="$(pwd)"
+    cat > hysteria2.service <<EOF
 [Unit]
-Description=Hysteria 2 Server
-Documentation=https://v2.hysteria.network/
-After=network-online.target
-Wants=network-online.target
+Description=Hysteria2 Server
+After=network.target
 
 [Service]
 Type=simple
-
-User=${HYSTERIA_USER}
-Group=${HYSTERIA_GROUP}
-
-ExecStart=${BINARY_PATH} server -c ${CONFIG_FILE}
-
+WorkingDirectory=${workdir}
+Environment=GOMEMLIMIT=${MEMORY_LIMIT}
+ExecStart=${workdir}/${BIN_NAME} server -c ${workdir}/server.yaml
 Restart=on-failure
-RestartSec=5s
-
-# 如果使用 443 等低端口，允许绑定低端口。
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-
-# 基本安全限制
+RestartSec=5
+MemoryMax=100M
+MemoryHigh=90M
 NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
 EOF
+    echo "📄 已生成 hysteria2.service（未自动安装）。想让它常驻、断开 SSH 也不掉线，可执行："
+    echo "   sudo cp hysteria2.service /etc/systemd/system/ && sudo systemctl enable --now hysteria2"
+}
 
-chmod 644 "$SERVICE_FILE"
+# ---------- 打印连接信息 ----------
+print_connection_info() {
+    local IP="$1"
+    echo "🎉 Hysteria2 部署成功！（低内存优化版）"
+    echo "=========================================================================="
+    echo "📋 服务器信息:"
+    echo "   🌐 IP地址: $IP"
+    echo "   🔌 端口: $SERVER_PORT"
+    echo "   🔑 密码: $AUTH_PASSWORD  (已保存于 $PASSWORD_FILE)"
+    echo "   🧠 GOMEMLIMIT: $MEMORY_LIMIT（可用 GOMEMLIMIT=xxx 环境变量覆盖）"
+    echo ""
+    echo "📱 节点链接（SNI=${SNI}, ALPN=${ALPN}, 跳过证书验证）:"
+    echo "hysteria2://${AUTH_PASSWORD}@${IP}:${SERVER_PORT}?sni=${SNI}&alpn=${ALPN}&insecure=1#Hy2-Bing"
+    echo ""
+    echo "📄 客户端配置文件:"
+    echo "server: ${IP}:${SERVER_PORT}"
+    echo "auth: ${AUTH_PASSWORD}"
+    echo "tls:"
+    echo "  sni: ${SNI}"
+    echo "  alpn: [\"${ALPN}\"]"
+    echo "  insecure: true"
+    echo "socks5:"
+    echo "  listen: 127.0.0.1:1080"
+    echo "http:"
+    echo "  listen: 127.0.0.1:8080"
+    echo "=========================================================================="
+    echo "⚠️ 前台直接运行的进程会在 SSH 断开后被杀掉。"
+    echo "   长期挂机请用 nohup/screen/tmux，或安装上面生成的 hysteria2.service。"
+}
 
-systemctl daemon-reload
+# ---------- 主逻辑 ----------
+main() {
+    download_binary
+    ensure_cert
+    write_config
+    write_systemd_unit
+    SERVER_IP=$(get_server_ip)
+    print_connection_info "$SERVER_IP"
+    export GOMEMLIMIT="$MEMORY_LIMIT"
+    echo "🚀 启动 Hysteria2 服务器..."
+    exec "$BIN_PATH" server -c server.yaml
+}
 
-# ============================================================
-# 启动服务
-# ============================================================
-
-echo
-echo "============================================================"
-echo "启动 Hysteria"
-echo "============================================================"
-
-systemctl enable hysteria-server.service
-systemctl restart hysteria-server.service
-
-sleep 3
-
-# ============================================================
-# 检查状态
-# ============================================================
-
-echo
-echo "============================================================"
-echo "检查服务状态"
-echo "============================================================"
-
-if systemctl is-active --quiet hysteria-server.service; then
-    echo "✅ Hysteria 启动成功"
-else
-    echo "❌ Hysteria 启动失败"
-    echo
-    echo "最近日志："
-    journalctl --no-pager -n 50 -u hysteria-server.service
-    exit 1
-fi
-
-# ============================================================
-# 获取服务器 IP
-# ============================================================
-
-SERVER_IP="$(curl -4 -s --max-time 10 https://api.ipify.org || true)"
-
-if [[ -z "$SERVER_IP" ]]; then
-    SERVER_IP="你的VPS_IP"
-fi
-
-# ============================================================
-# 输出信息
-# ============================================================
-
-echo
-echo
-echo "================================================================"
-echo "                 Hysteria 2 部署完成"
-echo "================================================================"
-echo
-echo "Hysteria 版本：${HYSTERIA_VERSION}"
-echo
-echo "服务器域名："
-echo "  ${DOMAIN}"
-echo
-echo "服务器 IP："
-echo "  ${SERVER_IP}"
-echo
-echo "端口："
-echo "  ${SERVER_PORT}/UDP"
-echo
-echo "密码："
-echo "  ${AUTH_PASSWORD}"
-echo
-echo "TLS SNI："
-echo "  ${DOMAIN}"
-echo
-echo "TLS insecure："
-echo "  false"
-echo
-echo "节点 URI："
-echo
-echo "hysteria2://${AUTH_PASSWORD}@${DOMAIN}:${SERVER_PORT}/?sni=${DOMAIN}&insecure=0"
-echo
-echo "================================================================"
-echo
-echo "服务管理："
-echo
-echo "查看状态："
-echo "  systemctl status hysteria-server"
-echo
-echo "查看日志："
-echo "  journalctl -u hysteria-server -f"
-echo
-echo "重启："
-echo "  systemctl restart hysteria-server"
-echo
-echo "停止："
-echo "  systemctl stop hysteria-server"
-echo
-echo "================================================================"
-echo
-echo "⚠️ 请保存好上面的密码。"
-echo "⚠️ 请确认 Cloudflare DNS 中 ${DOMAIN} 已指向 ${SERVER_IP}。"
-echo "⚠️ Cloudflare 代理请设置为 DNS Only（灰云），不要开启橙云。"
-echo
-echo "================================================================"
+main "$@"
