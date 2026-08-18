@@ -26,12 +26,12 @@ echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # ---------- 依赖检查 ----------
 check_deps() {
     local missing=()
-    for bin in curl openssl sha256sum jq grep sed awk uname; do
+    for bin in curl openssl sha256sum grep sed awk uname; do
         command -v "$bin" >/dev/null 2>&1 || missing+=("$bin")
     done
     if [ "${#missing[@]}" -ne 0 ]; then
         echo "❌ 缺少必要依赖: ${missing[*]}"
-        echo "   Debian/Ubuntu 可执行: sudo apt update && sudo apt install -y curl openssl coreutils jq grep sed gawk"
+        echo "   Debian/Ubuntu 可执行: sudo apt update && sudo apt install -y curl openssl coreutils grep sed gawk"
         exit 1
     fi
 }
@@ -111,9 +111,16 @@ detect_latest_version() {
         echo "❌ 无法访问 GitHub API 获取版本信息,已终止(不回退到旧版本)。" >&2
         exit 1
     fi
-    version=$(printf '%s' "$json" | jq -r '
-        [.[] | select(.draft==false and .prerelease==false and (.tag_name|startswith("app/v")))]
-        | .[0].tag_name // empty')
+    # 不依赖 jq：GitHub API 默认返回“每行一个字段”的美化 JSON，逐行匹配 tag_name / draft / prerelease
+    version=$(printf '%s\n' "$json" | awk '
+        /"tag_name":/   { gsub(/[",]/,""); split($0,a,": "); tag=a[2] }
+        /"draft":/      { gsub(/[",]/,""); split($0,a,": "); draft=a[2] }
+        /"prerelease":/ { gsub(/[",]/,""); split($0,a,": "); pre=a[2]
+            if (tag ~ /^app\/v[0-9]+\.[0-9]+\.[0-9]+$/ && draft=="false" && pre=="false") {
+                print tag; exit
+            }
+        }
+    ')
     if [[ -z "$version" ]]; then
         echo "❌ 未能获取到正式(非 beta/RC/预发布)版本号,已终止。" >&2
         exit 1
