@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ---------- 脚本自身目录(无论从哪里执行,都统一以脚本所在目录为工作目录) ----------
+# ---------- 脚本自身目录 ----------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -15,32 +15,36 @@ ALPN="h3"
 MEMORY_LIMIT="${GOMEMLIMIT:-70MiB}"
 GITHUB_REPO="apernet/hysteria"
 SERVICE_NAME="hysteria2"
-RUN_USER="${RUN_USER:-hysteria2}"
+RUN_USER="${RUN_USER:-hysteria2}"        # 默认专用低权限账号，而不是 root
 RUN_GROUP="${RUN_GROUP:-$RUN_USER}"
-UPDATE_ONLY=0
+LOG_LEVEL="${HYSTERIA_LOG_LEVEL:-warn}"  # debug/info/warn/error，默认 warn 减少日志量
+AUTO_INSTALL="${AUTO_INSTALL:-1}"        # 1=自动安装并用 systemd 常驻启动；0=只生成文件，前台运行一次
 # ------------------------------
 
-# 支持 `bash hysteria2.sh --update-only [端口]`:只做"下载+校验+写配置"不动 systemd/防火墙/不启动,
-# 供 hysteria2-update.sh 复用同一套下载/校验逻辑,避免两处代码维护两份。
-if [[ "${1:-}" == "--update-only" ]]; then
-    UPDATE_ONLY=1
-    shift
-fi
+log()  { echo "$@"; }
+err()  { echo "$@" >&2; }
 
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-echo "Hysteria2 一键部署脚本(自动最新稳定版 · SHA256 校验 · 自签证书 · pinSHA256)"
-echo "支持命令行端口参数,如:bash hysteria2.sh 443"
+echo "Hysteria2 一键部署脚本（自动最新稳定版 · SHA256 校验 · 自签证书 · pinSHA256 · systemd 加固）"
+echo "用法: bash hysteria2.sh [端口]            部署/更新并启动"
+echo "      bash hysteria2.sh diagnose          仅诊断当前部署为何连不通"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+
+MODE="deploy"
+if [[ "${1:-}" == "diagnose" || "${1:-}" == "--diagnose" ]]; then
+    MODE="diagnose"
+    shift || true
+fi
 
 # ---------- 依赖检查 ----------
 check_deps() {
     local missing=()
-    for bin in curl openssl sha256sum grep sed awk uname; do
+    for bin in curl openssl sha256sum grep sed awk uname ss; do
         command -v "$bin" >/dev/null 2>&1 || missing+=("$bin")
     done
     if [ "${#missing[@]}" -ne 0 ]; then
-        echo "❌ 缺少必要依赖: ${missing[*]}"
-        echo "   Debian/Ubuntu 可执行: sudo apt update && sudo apt install -y curl openssl coreutils grep sed gawk"
+        err "❌ 缺少必要依赖: ${missing[*]}"
+        err "   Debian/Ubuntu 可执行: sudo apt update && sudo apt install -y curl openssl coreutils grep sed gawk iproute2"
         exit 1
     fi
 }
@@ -50,49 +54,31 @@ check_deps
 parse_port() {
     local candidate="$1"
     if [[ ! "$candidate" =~ ^[0-9]+$ ]] || [ "$candidate" -lt 1 ] || [ "$candidate" -gt 65535 ]; then
-        echo "❌ 非法端口: $candidate(必须是 1-65535 之间的整数)"
+        err "❌ 非法端口: $candidate（必须是 1-65535 之间的整数）"
         exit 1
     fi
 }
+
+if [[ -f server.yaml && $# -eq 0 ]]; then
+    # 复用已有部署的端口，避免 diagnose/重新运行时端口对不上
+    EXISTING_PORT=$(grep -E '^listen:' server.yaml | sed -E 's/^listen:\s*":?([0-9]+)".*/\1/' || true)
+fi
 
 if [[ $# -ge 1 && -n "${1:-}" ]]; then
     SERVER_PORT="$1"
     parse_port "$SERVER_PORT"
-    echo "✅ 使用命令行指定端口: $SERVER_PORT"
-elif [[ -f server.yaml ]]; then
-    # --update-only 场景下没人传端口,优先复用已有配置里的端口,而不是回退到默认端口
-    SERVER_PORT="$(grep '^listen:' server.yaml | grep -oE '[0-9]+' | head -n1 || true)"
-    SERVER_PORT="${SERVER_PORT:-${SERVER_PORT_ENV:-$DEFAULT_PORT}}"
+    log "✅ 使用命令行指定端口: $SERVER_PORT"
+elif [[ -n "${EXISTING_PORT:-}" ]]; then
+    SERVER_PORT="$EXISTING_PORT"
     parse_port "$SERVER_PORT"
-    echo "⚙️ 复用已有配置中的端口: $SERVER_PORT"
+    log "♻️  复用已有配置里的端口: $SERVER_PORT"
 else
     SERVER_PORT="${SERVER_PORT:-$DEFAULT_PORT}"
     parse_port "$SERVER_PORT"
-    echo "⚙️ 未提供端口参数,使用默认端口: $SERVER_PORT"
+    log "⚙️ 未提供端口参数，使用默认端口: $SERVER_PORT"
 fi
 
-# ---------- 密码:环境变量 > 已保存的密码 > 自动生成(脚本开箱即用,环境变量只是可选覆盖) ----------
-sanitize_password() {
-    if [[ "$1" == *'"'* || "$1" == *'\'* ]]; then
-        echo "❌ AUTH_PASSWORD 中包含引号或反斜杠,可能破坏配置文件格式,请更换密码后重试。"
-        exit 1
-    fi
-}
-
-if [[ -n "${AUTH_PASSWORD:-}" ]]; then
-    sanitize_password "$AUTH_PASSWORD"
-    echo "✅ 使用环境变量指定的密码"
-elif [[ -f "$PASSWORD_FILE" ]]; then
-    AUTH_PASSWORD=$(tr -d '\r\n' < "$PASSWORD_FILE")
-    echo "✅ 检测到已保存的密码($PASSWORD_FILE),复用它以免重复运行时密码跟着变"
-else
-    AUTH_PASSWORD=$(openssl rand -hex 16)
-    echo "$AUTH_PASSWORD" > "$PASSWORD_FILE"
-    chmod 600 "$PASSWORD_FILE"
-    echo "🔑 已自动生成随机密码并保存到 $PASSWORD_FILE(想固定密码可 export AUTH_PASSWORD=xxx 后再运行)"
-fi
-
-# ---------- 检测架构 ----------
+# ---------- 检测架构（diagnose 模式也需要，用于确认二进制存在） ----------
 arch_name() {
     local machine
     machine=$(uname -m | tr '[:upper:]' '[:lower:]')
@@ -108,21 +94,133 @@ arch_name() {
         *)                    echo "" ;;
     esac
 }
-
 ARCH="${BIN_ARCH_OVERRIDE:-$(arch_name)}"
 if [ -z "$ARCH" ]; then
-  echo "❌ 无法识别 CPU 架构: $(uname -m)"
-  echo "   可手动指定,例如: BIN_ARCH_OVERRIDE=amd64 bash hysteria2.sh"
+  err "❌ 无法识别 CPU 架构: $(uname -m)"
+  err "   可手动指定，例如: BIN_ARCH_OVERRIDE=amd64 bash hysteria2.sh"
   exit 1
 fi
+BIN_NAME="hysteria-linux-${ARCH}"
+BIN_PATH="${SCRIPT_DIR}/${BIN_NAME}"
 
-# ---------- 自动获取最新稳定版本号(排除 beta/RC/预发布,失败直接退出不回退旧版本) ----------
+# ============================================================
+#  诊断模式：不改动任何东西，只检查“为什么连不上”
+# ============================================================
+diagnose() {
+    echo "==================== 连通性诊断 ===================="
+    local fail=0
+
+    # 1. systemd 服务状态
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE_NAME}.service"; then
+        if systemctl is-active --quiet "$SERVICE_NAME"; then
+            echo "✅ systemd 服务 ${SERVICE_NAME} 正在运行"
+        else
+            echo "❌ systemd 服务 ${SERVICE_NAME} 未运行（这是最常见的“连不通”原因）"
+            echo "   最近日志："
+            journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null | sed 's/^/     /'
+            fail=1
+        fi
+    else
+        echo "❌ 尚未安装 ${SERVICE_NAME}.service —— 说明你之前很可能是前台直接运行脚本，"
+        echo "   一旦 SSH 断开或终端关闭，进程就被杀掉了，这是“连接不通”最常见的原因。"
+        fail=1
+    fi
+
+    # 2. 端口是否真的在监听（UDP）
+    if [[ -f server.yaml ]]; then
+        local port
+        port=$(grep -E '^listen:' server.yaml | sed -E 's/^listen:\s*":?([0-9]+)".*/\1/')
+        if ss -lun 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${port}\$"; then
+            echo "✅ 本机 UDP ${port} 端口正在监听"
+        else
+            echo "❌ 本机没有任何进程在监听 UDP ${port}，服务实际上没跑起来"
+            fail=1
+        fi
+    else
+        echo "⚠️ 未找到 server.yaml，可能还没部署过"
+        fail=1
+    fi
+
+    # 3. 本机防火墙
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        if ufw status 2>/dev/null | grep -q "${SERVER_PORT}/udp"; then
+            echo "✅ ufw 已放行 ${SERVER_PORT}/udp"
+        else
+            echo "❌ ufw 已启用，但没有放行 ${SERVER_PORT}/udp"
+            echo "   修复: sudo ufw allow ${SERVER_PORT}/udp"
+            fail=1
+        fi
+    elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+        if firewall-cmd --list-ports 2>/dev/null | grep -q "${SERVER_PORT}/udp"; then
+            echo "✅ firewalld 已放行 ${SERVER_PORT}/udp"
+        else
+            echo "❌ firewalld 正在运行，但没有放行 ${SERVER_PORT}/udp"
+            echo "   修复: sudo firewall-cmd --add-port=${SERVER_PORT}/udp --permanent && sudo firewall-cmd --reload"
+            fail=1
+        fi
+    else
+        echo "ℹ️ 未检测到 ufw/firewalld 处于启用状态（可能用的是裸 iptables，或没有本机防火墙）"
+    fi
+
+    # 4. 证书有效期
+    if [[ -f "$CERT_FILE" ]]; then
+        if openssl x509 -in "$CERT_FILE" -noout -checkend 86400 >/dev/null 2>&1; then
+            echo "✅ 证书未过期（至少还有 1 天有效期）"
+        else
+            echo "❌ 证书已过期或即将过期，客户端 TLS 握手会失败"
+            fail=1
+        fi
+    fi
+
+    # 5. 出网连通性 / DNS
+    if curl -fsL --max-time 5 https://api.ipify.org >/dev/null 2>&1; then
+        echo "✅ 服务器出网正常（能访问外部 HTTPS）"
+    else
+        echo "⚠️ 服务器出网异常或 DNS 解析失败，无法访问外部服务（不影响客户端直连，但会影响自动更新/IP探测）"
+    fi
+
+    echo "======================================================"
+    echo "⚠️ 以上只能检查“服务端本身”。如果本机一切正常但客户端仍连不上，"
+    echo "   99% 的剩余原因是：云厂商安全组 / 控制台防火墙没有放行 UDP ${SERVER_PORT}端口"
+    echo "   （这一步在 VPS 内部完全看不出来，必须去云控制台手动检查）。"
+    if [[ $fail -eq 0 ]]; then
+        echo "🎉 本机侧检查全部通过。"
+    fi
+}
+
+if [[ "$MODE" == "diagnose" ]]; then
+    diagnose
+    exit 0
+fi
+
+# ---------- 密码 ----------
+sanitize_password() {
+    if [[ "$1" == *'"'* || "$1" == *'\'* ]]; then
+        err "❌ AUTH_PASSWORD 中包含引号或反斜杠，可能破坏配置文件格式，请更换密码后重试。"
+        exit 1
+    fi
+}
+
+if [[ -n "${AUTH_PASSWORD:-}" ]]; then
+    sanitize_password "$AUTH_PASSWORD"
+    log "✅ 使用环境变量指定的密码"
+elif [[ -f "$PASSWORD_FILE" ]]; then
+    AUTH_PASSWORD=$(tr -d '\r\n' < "$PASSWORD_FILE")
+    log "✅ 检测到已保存的密码($PASSWORD_FILE)，复用它以免重复运行时密码跟着变"
+else
+    AUTH_PASSWORD=$(openssl rand -hex 16)
+    echo "$AUTH_PASSWORD" > "$PASSWORD_FILE"
+    chmod 600 "$PASSWORD_FILE"
+    log "🔑 已自动生成随机密码并保存到 $PASSWORD_FILE"
+fi
+
+# ---------- 自动获取最新稳定版本号 ----------
 detect_latest_version() {
-    echo "🔍 正在查询 Hysteria 官方最新稳定版本..." >&2
+    err "🔍 正在查询 Hysteria 官方最新稳定版本..."
     local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=30"
     local json version
     if ! json=$(curl -fsSL --connect-timeout 10 --max-time 20 "$api_url" 2>/dev/null); then
-        echo "❌ 无法访问 GitHub API 获取版本信息,已终止(不回退到旧版本)。" >&2
+        err "❌ 无法访问 GitHub API 获取版本信息，已终止（不回退到旧版本）。"
         exit 1
     fi
     version=$(printf '%s\n' "$json" | awk '
@@ -135,7 +233,7 @@ detect_latest_version() {
         }
     ')
     if [[ -z "$version" ]]; then
-        echo "❌ 未能获取到正式(非 beta/RC/预发布)版本号,已终止。" >&2
+        err "❌ 未能获取到正式（非 beta/RC/预发布）版本号，已终止。"
         exit 1
     fi
     printf '%s' "$version"
@@ -143,32 +241,29 @@ detect_latest_version() {
 
 HYSTERIA_VERSION_TAG="$(detect_latest_version)"
 HYSTERIA_VERSION="${HYSTERIA_VERSION_TAG#app/}"
-echo "✅ 最新稳定版本: ${HYSTERIA_VERSION}(release tag: ${HYSTERIA_VERSION_TAG})"
-
-BIN_NAME="hysteria-linux-${ARCH}"
-BIN_PATH="./${BIN_NAME}"
+log "✅ 最新稳定版本: ${HYSTERIA_VERSION}（release tag: ${HYSTERIA_VERSION_TAG}）"
 
 # ---------- 校验和验证 ----------
 verify_checksum() {
     local hash_url="https://github.com/apernet/hysteria/releases/download/${HYSTERIA_VERSION_TAG}/hashes.txt"
     local hashes expected actual
     if ! hashes=$(curl -fsL --connect-timeout 10 --max-time 20 "$hash_url" 2>/dev/null); then
-        echo "⚠️ 未能获取官方 hashes.txt(${HYSTERIA_VERSION_TAG}),无法验证二进制完整性。"
+        err "⚠️ 未能获取官方 hashes.txt(${HYSTERIA_VERSION_TAG})，无法验证二进制完整性。"
         return 1
     fi
     expected=$(printf '%s\n' "$hashes" | awk -v bin="$BIN_NAME" '
         { n = split($NF, parts, "/"); if (parts[n] == bin) { print $1; exit } }
     ' || true)
     if [[ -z "$expected" ]]; then
-        echo "⚠️ hashes.txt(${HYSTERIA_VERSION_TAG})里没有 ${BIN_NAME} 对应条目,无法验证。"
+        err "⚠️ hashes.txt(${HYSTERIA_VERSION_TAG})里没有 ${BIN_NAME} 对应条目，无法验证。"
         return 1
     fi
     actual=$(sha256sum "$BIN_PATH" | awk '{print $1}')
     if [[ "$expected" == "$actual" ]]; then
-        echo "✅ SHA256 校验通过,二进制完整可信。"
+        log "✅ SHA256 校验通过，二进制完整可信。"
         return 0
     else
-        echo "⚠️ SHA256 不匹配(期望 $expected,实际 $actual),与当前最新版(${HYSTERIA_VERSION_TAG})不一致。"
+        err "⚠️ SHA256 不匹配（期望 $expected，实际 $actual）。"
         return 1
     fi
 }
@@ -176,57 +271,82 @@ verify_checksum() {
 # ---------- 下载二进制 ----------
 download_binary() {
     if [ -f "$BIN_PATH" ]; then
-        echo "🔍 发现已存在的二进制 $BIN_PATH,先校验完整性(对照当前最新版 ${HYSTERIA_VERSION_TAG})..."
+        log "🔍 发现已存在的二进制，先校验完整性（对照当前最新版 ${HYSTERIA_VERSION_TAG}）..."
         if verify_checksum; then
-            echo "✅ 校验通过,复用已存在的二进制,跳过下载。"
+            log "✅ 校验通过，复用已存在的二进制，跳过下载。"
             return
         fi
-        echo "ℹ️ 该文件可能是旧版本、已损坏或被篡改,将重新下载最新版本覆盖它。"
+        log "ℹ️ 该文件可能是旧版本、已损坏或被篡改，将重新下载最新版本覆盖它。"
         rm -f "$BIN_PATH"
     fi
     local url="https://github.com/apernet/hysteria/releases/download/${HYSTERIA_VERSION_TAG}/${BIN_NAME}"
-    echo "⏳ 下载: $url"
+    log "⏳ 下载: $url"
     if ! curl -fL --retry 3 --connect-timeout 30 -o "$BIN_PATH" "$url"; then
-        echo "❌ 下载失败,请确认版本号/架构名正确,且网络能访问 GitHub。"
+        err "❌ 下载失败，请确认版本号/架构名正确，且网络能访问 GitHub。"
         rm -f "$BIN_PATH"
         exit 1
     fi
     chmod +x "$BIN_PATH"
-    echo "✅ 下载完成并设置可执行: $BIN_PATH"
+    log "✅ 下载完成并设置可执行: $BIN_PATH"
     if ! verify_checksum; then
-        echo "❌ 文件可能损坏或被篡改(或校验信息不可获取),已删除并终止(不允许启动未验证的二进制)。"
+        err "❌ 文件可能损坏或被篡改，已删除并终止。"
         rm -f "$BIN_PATH"
         exit 1
     fi
 }
 
-# ---------- 生成自签证书(cert/key 必须成对管理) ----------
+# ---------- 生成自签证书 ----------
 ensure_cert() {
     if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
-        echo "✅ 发现完整证书对,复用现有 cert/key(不重新生成,pinSHA256 保持不变)。"
+        log "✅ 发现完整证书对，复用现有 cert/key（pinSHA256 保持不变）。"
         return
     fi
     if [ -f "$CERT_FILE" ] || [ -f "$KEY_FILE" ]; then
-        echo "❌ 检测到 $CERT_FILE 与 $KEY_FILE 只存在其中一个,证书对不完整。"
-        echo "   为避免覆盖/误删已有文件,已终止。请手动确认后删除残留的单个文件再重新运行。"
+        err "❌ 检测到 $CERT_FILE 与 $KEY_FILE 只存在其中一个，证书对不完整，已终止。"
         exit 1
     fi
-    echo "🔑 未发现证书,使用 openssl 生成自签证书(prime256v1,CN=${SNI})..."
+    log "🔑 未发现证书，使用 openssl 生成自签证书（prime256v1，CN=${SNI}）..."
     openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -days 3650 -keyout "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=${SNI}"
     chmod 600 "$KEY_FILE"
-    echo "✅ 证书生成成功。"
+    log "✅ 证书生成成功。"
 }
 
-# ---------- 计算证书 pinSHA256 指纹 ----------
 compute_pin_sha256() {
     local fp
     fp=$(openssl x509 -in "$CERT_FILE" -noout -fingerprint -sha256 2>/dev/null | sed -E 's/^.*Fingerprint=//')
     if [[ -z "$fp" ]]; then
-        echo "❌ 无法计算证书 SHA256 指纹,已终止。" >&2
+        err "❌ 无法计算证书 SHA256 指纹，已终止。"
         exit 1
     fi
     printf '%s' "$fp"
+}
+
+# ---------- 创建专用运行账号（权限隔离核心） ----------
+ensure_run_user() {
+    if ! id "$RUN_USER" >/dev/null 2>&1; then
+        if [[ $EUID -ne 0 ]]; then
+            err "⚠️ 当前非 root，无法创建系统账号 ${RUN_USER}，systemd 单元将退回以当前用户身份的说明运行（需你手动处理）。"
+            return
+        fi
+        log "👤 创建专用系统账号 ${RUN_USER}（无登录 shell、无 home，仅用于运行 Hysteria2）..."
+        useradd --system --no-create-home --shell /usr/sbin/nologin "$RUN_USER" 2>/dev/null \
+            || useradd --system --no-create-home --shell /sbin/nologin "$RUN_USER"
+    else
+        log "✅ 系统账号 ${RUN_USER} 已存在，复用。"
+    fi
+}
+
+# ---------- 收紧文件权限归属，使专用账号只能读它需要的东西 ----------
+lock_down_permissions() {
+    if [[ $EUID -eq 0 ]] && id "$RUN_USER" >/dev/null 2>&1; then
+        chown "${RUN_USER}:${RUN_GROUP}" "$KEY_FILE" "$CERT_FILE" server.yaml "$BIN_PATH" 2>/dev/null || true
+        chmod 600 "$KEY_FILE" server.yaml
+        chmod 644 "$CERT_FILE"
+        chmod 750 "$BIN_PATH"
+        chmod 700 "$SCRIPT_DIR"
+        log "🔒 已将证书/密钥/配置/二进制的属主收紧为 ${RUN_USER}，其他账号（含普通用户）读不到。"
+    fi
 }
 
 # ---------- 写配置文件 ----------
@@ -236,9 +356,6 @@ write_config() {
         bw_block="bandwidth:
   up: \"${SERVER_BW_UP}\"
   down: \"${SERVER_BW_DOWN}\""
-        echo "ℹ️ 已按 SERVER_BW_UP/SERVER_BW_DOWN 写入 bandwidth 段。"
-    else
-        echo "ℹ️ 未设置 SERVER_BW_UP/SERVER_BW_DOWN,不写入 bandwidth 段,交给 Hysteria2 自身带宽探测处理。"
     fi
 
     cat > server.yaml <<EOF
@@ -263,13 +380,12 @@ EOF
     chmod 600 server.yaml
 
     if ! grep -q '^listen:' server.yaml || ! grep -q '^auth:' server.yaml; then
-        echo "❌ 配置文件生成异常(缺少关键字段),已终止,不会启动服务。"
+        err "❌ 配置文件生成异常（缺少关键字段），已终止，不会启动服务。"
         exit 1
     fi
-    echo "✅ 写入配置 server.yaml(端口=${SERVER_PORT}, SNI=${SNI}[仅 TLS SNI], ALPN=${ALPN})。"
+    log "✅ 写入配置 server.yaml（端口=${SERVER_PORT}, SNI=${SNI}[仅 TLS SNI], ALPN=${ALPN}）。"
 }
 
-# ---------- 获取服务器公网 IP ----------
 get_server_ip() {
     local ip local_ip
     ip=$(curl -fsL --max-time 8 https://api.ipify.org 2>/dev/null) \
@@ -278,8 +394,7 @@ get_server_ip() {
     if [[ -z "$ip" ]]; then
         local_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
         if [[ -n "$local_ip" ]]; then
-            echo "⚠️ 无法访问外部 IP 探测服务,回退使用本机网卡地址 $local_ip" >&2
-            echo "⚠️ 如果服务器在 NAT/内网环境,这可能不是公网可达地址,请手动核实。" >&2
+            err "⚠️ 无法访问外部 IP 探测服务，回退使用本机网卡地址 $local_ip（NAT 环境下可能不是公网地址）。"
             ip="$local_ip"
         else
             ip="YOUR_SERVER_IP"
@@ -288,139 +403,86 @@ get_server_ip() {
     echo "$ip"
 }
 
-# ---------- 【连通性关键项 1】自动放行本机防火墙 UDP 端口 ----------
-# Hysteria2 是 UDP/QUIC 协议,"连接不通"最常见原因就是:
-#   本机防火墙没放 UDP、或云厂商安全组没放 UDP、或两者都没放。
-# 本机这层能自动做,云厂商那层脚本够不到,只能强提示。
-open_firewall_port() {
-    local port="$1"
-    if [[ "$(id -u)" -ne 0 ]]; then
-        echo "⚠️ 当前非 root 运行,跳过自动防火墙配置。请自行确认 UDP ${port} 已放行(或用 sudo 重跑本脚本)。"
-        return
-    fi
-    echo "🔧 检测并尝试放行本机防火墙 UDP ${port} 端口..."
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
-        ufw allow "${port}/udp" >/dev/null 2>&1 \
-            && echo "✅ ufw 已放行 UDP ${port}" \
-            || echo "⚠️ ufw 放行失败,请手动执行: ufw allow ${port}/udp"
-    elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
-        firewall-cmd --permanent --add-port="${port}/udp" >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1 \
-            && echo "✅ firewalld 已放行 UDP ${port}" \
-            || echo "⚠️ firewalld 放行失败,请手动执行: firewall-cmd --permanent --add-port=${port}/udp && firewall-cmd --reload"
-    elif command -v iptables >/dev/null 2>&1; then
-        if ! iptables -C INPUT -p udp --dport "${port}" -j ACCEPT 2>/dev/null; then
-            iptables -I INPUT -p udp --dport "${port}" -j ACCEPT 2>/dev/null \
-                && echo "✅ iptables 已放行 UDP ${port}(重启可能失效,建议 apt install iptables-persistent 持久化)" \
-                || echo "⚠️ iptables 放行失败,请手动配置"
-        else
-            echo "✅ iptables 规则已存在,无需重复添加"
-        fi
-    else
-        echo "ℹ️ 未检测到 ufw/firewalld/iptables,跳过自动放行,请自行确认防火墙状态。"
-    fi
-    echo "⚠️ 重要:阿里云/腾讯云/AWS 等云厂商的"安全组/网络ACL"需要额外在控制台放行 UDP ${port},本脚本无法代为操作,请务必手动检查——这是"连接不通"最常见的原因。"
-}
-
-# ---------- 生成 systemd 预检脚本(ExecStartPre,启动前把能查的都查一遍,避免秒退) ----------
+# ---------- 生成 ExecStartPre 用的启动前自检脚本 ----------
+# 任何一项不过直接 exit 非零 -> systemd 会 fail-fast 并把原因写进 journal，
+# 而不是让主进程带着坏配置起来又秒退、日志里只有一句语焉不详的报错。
 write_preflight_script() {
-    cat > hysteria2-preflight.sh <<'PFEOF'
+    cat > "${SCRIPT_DIR}/hysteria2-preflight.sh" <<'PFEOF'
 #!/usr/bin/env bash
-# Hysteria2 启动前健康检查:配置语法 / 证书有效期 / 端口占用 / DNS / 出网连通性
-# 任一致命项不通过则直接非 0 退出,systemd 会 fail-fast 并记录清晰原因,
-# 而不是让主进程带着坏配置起来又立刻崩溃、在日志里只留一行看不懂的报错。
-set -uo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR"
 
-CONFIG="server.yaml"
-CERT="cert.pem"
-KEY="key.pem"
+fail() { echo "[preflight] ❌ $*" >&2; exit 1; }
+ok()   { echo "[preflight] ✅ $*"; }
 
-fail() { echo "❌ [preflight] $1" >&2; exit 1; }
-warn() { echo "⚠️ [preflight] $1" >&2; }
+# 1. 配置文件存在且关键字段齐全
+[[ -f server.yaml ]] || fail "server.yaml 不存在"
+grep -q '^listen:' server.yaml || fail "server.yaml 缺少 listen 字段"
+grep -q '^auth:'   server.yaml || fail "server.yaml 缺少 auth 字段"
+ok "配置文件检查通过"
 
-# 1) 配置文件存在 + 关键字段完整
-[[ -f "$CONFIG" ]] || fail "配置文件 $CONFIG 不存在"
-grep -q '^listen:' "$CONFIG" || fail "配置缺少 listen 字段"
-grep -q '^auth:'   "$CONFIG" || fail "配置缺少 auth 字段"
+# 2. 证书存在、可读、未过期
+CERT=$(grep -E '^\s*cert:' server.yaml | sed -E 's/.*cert:\s*"?([^"]+)"?.*/\1/')
+KEY=$(grep -E '^\s*key:'  server.yaml | sed -E 's/.*key:\s*"?([^"]+)"?.*/\1/')
+[[ -r "$CERT" ]] || fail "证书文件不存在或不可读: $CERT"
+[[ -r "$KEY"  ]] || fail "私钥文件不存在或不可读: $KEY"
+openssl x509 -in "$CERT" -noout -checkend 0 >/dev/null 2>&1 || fail "证书已过期: $CERT"
+ok "证书检查通过（存在、可读、未过期）"
 
-PORT=$(grep '^listen:' "$CONFIG" | grep -oE '[0-9]+' | head -n1)
-[[ "$PORT" =~ ^[0-9]+$ ]] || fail "无法从配置解析监听端口"
-
-# 2) 证书存在 + 未过期(7天内过期只警告,已过期直接阻止启动)
-[[ -f "$CERT" && -f "$KEY" ]] || fail "证书文件缺失: $CERT / $KEY"
-if ! openssl x509 -in "$CERT" -noout -checkend 0 >/dev/null 2>&1; then
-    fail "证书已过期: $CERT,请重新生成后再启动"
+# 3. 端口未被其他进程占用
+PORT=$(grep -E '^listen:' server.yaml | sed -E 's/^listen:\s*":?([0-9]+)".*/\1/')
+if ss -lun 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${PORT}\$"; then
+    fail "UDP 端口 ${PORT} 已被占用（可能是上一次实例未退出，或端口冲突）"
 fi
-if ! openssl x509 -in "$CERT" -noout -checkend 604800 >/dev/null 2>&1; then
-    warn "证书将在 7 天内过期,建议尽快更换"
-fi
+ok "端口 ${PORT} 空闲"
 
-# 3) 端口是否已被其他进程占用(重启场景下自己占用自己不算)
-if command -v ss >/dev/null 2>&1; then
-    OWNER_PID=$(ss -ulnp 2>/dev/null | awk -v p=":$PORT" '$5 ~ p {print $0}' | grep -oP 'pid=\K[0-9]+' | head -n1 || true)
-    if [[ -n "$OWNER_PID" && -n "${MAINPID:-}" && "$OWNER_PID" != "${MAINPID:-}" ]]; then
-        fail "UDP 端口 ${PORT} 已被其他进程(PID ${OWNER_PID})占用,请先释放该端口"
-    fi
+# 4. DNS / 出网连通性（尽力而为，失败只警告不阻断启动，避免断网环境下无法自愈重启）
+if ! getent hosts github.com >/dev/null 2>&1 && ! getent hosts 1.1.1.1 >/dev/null 2>&1; then
+    echo "[preflight] ⚠️ DNS 解析异常，可能影响后续自动更新（不影响本次启动）" >&2
 fi
 
-# 4) DNS 解析(尽力而为,不阻断启动,只强提示——Hysteria2 本身接收连接不依赖出网)
-if ! getent hosts github.com >/dev/null 2>&1; then
-    warn "DNS 解析异常,可能影响后续自动更新,不影响当前服务对外提供连接"
-fi
-
-# 5) 出网连通性(同上,仅提示)
-if command -v curl >/dev/null 2>&1; then
-    if ! curl -fsL --max-time 5 https://www.gstatic.com/generate_204 >/dev/null 2>&1; then
-        warn "出网连通性检测失败,若只需被动接受客户端连接可忽略"
-    fi
-fi
-
-echo "✅ [preflight] 检查通过,端口=${PORT}"
-exit 0
+ok "全部启动前检查通过"
 PFEOF
-    chmod +x hysteria2-preflight.sh
-    echo "✅ 已生成 hysteria2-preflight.sh(systemd 启动前会自动执行)。"
+    chmod +x "${SCRIPT_DIR}/hysteria2-preflight.sh"
+    if [[ $EUID -eq 0 ]] && id "$RUN_USER" >/dev/null 2>&1; then
+        chown "${RUN_USER}:${RUN_GROUP}" "${SCRIPT_DIR}/hysteria2-preflight.sh"
+    fi
+    log "✅ 已生成启动前自检脚本 hysteria2-preflight.sh"
 }
 
-# ---------- 生成 systemd 单元文件(安全加固版) ----------
+# ---------- 生成加固版 systemd 单元 ----------
 write_systemd_unit() {
-    # 用专用系统账号运行,而不是 root:即使 Hysteria2 出漏洞,
-    # 攻击者拿到的也只是一个受限账号的权限,而不是整台 VPS 的 root。
-    if [[ "$(id -u)" -eq 0 ]]; then
-        if ! id "$RUN_USER" >/dev/null 2>&1; then
-            if command -v useradd >/dev/null 2>&1; then
-                useradd --system --no-create-home --shell /usr/sbin/nologin "$RUN_USER" 2>/dev/null \
-                    && echo "✅ 已创建专用服务账号: $RUN_USER(无 shell、不可登录)" \
-                    || echo "⚠️ 创建账号 $RUN_USER 失败,请手动创建后重跑本脚本。"
-            else
-                echo "⚠️ 未找到 useradd,无法自动创建专用账号,请手动创建 $RUN_USER 后重跑。"
-            fi
-        fi
-        chown -R "${RUN_USER}:${RUN_GROUP}" "$SCRIPT_DIR" 2>/dev/null || true
+    local user_block="User=${RUN_USER}
+Group=${RUN_GROUP}"
+
+    # <1024 的特权端口需要单独授予 CAP_NET_BIND_SERVICE，否则非 root 账号 bind 会失败
+    local cap_line=""
+    if [[ "$SERVER_PORT" -lt 1024 ]]; then
+        cap_line="AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
     else
-        echo "⚠️ 当前非 root 运行,跳过专用账号创建/chown,systemd 单元仍会写入 User=${RUN_USER},请自行确保该账号存在且有权限访问 ${SCRIPT_DIR}。"
+        cap_line="CapabilityBoundingSet="
     fi
 
-    cat > hysteria2.service <<EOF
+    cat > "${SCRIPT_DIR}/${SERVICE_NAME}.service" <<EOF
 [Unit]
 Description=Hysteria2 Server
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=3
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
-User=${RUN_USER}
-Group=${RUN_GROUP}
 WorkingDirectory=${SCRIPT_DIR}
+${user_block}
 Environment=GOMEMLIMIT=${MEMORY_LIMIT}
-
-# 启动前健康检查:配置语法 / 证书有效期 / 端口占用 / DNS / 出网连通性
+Environment=HYSTERIA_LOG_LEVEL=${LOG_LEVEL}
 ExecStartPre=${SCRIPT_DIR}/hysteria2-preflight.sh
-ExecStart=${SCRIPT_DIR}/${BIN_NAME} server -c ${SCRIPT_DIR}/server.yaml
+ExecStart=${BIN_PATH} server -c ${SCRIPT_DIR}/server.yaml
 
+# ---- 重启策略 ----
 Restart=on-failure
 RestartSec=5
 
@@ -429,210 +491,143 @@ MemoryMax=100M
 MemoryHigh=90M
 TasksMax=64
 
-# ---- 权限最小化 / 禁止提权 ----
-# <1024 端口需要 CAP_NET_BIND_SERVICE;>=1024 端口理论上不需要,但保留该单一能力
-# 影响不大,换低端口时不用再改这里。
+# ---- 权限最小化 / 提权防护 ----
+${cap_line}
 NoNewPrivileges=true
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_BIND_SERVICE
+LockPersonality=true
 RestrictSUIDSGID=true
+RestrictRealtime=true
 RemoveIPC=true
 
-# ---- 文件系统访问范围限制 ----
+# ---- 文件系统隔离 ----
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=${SCRIPT_DIR}
+PrivateDevices=true
+ProtectClock=true
+ProtectHostname=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true
 ProtectControlGroups=true
-ProtectClock=true
-ProtectHostname=true
-ProtectProc=invisible
-ProcSubset=pid
+ReadOnlyPaths=${SCRIPT_DIR}
+UMask=0077
 
-# ---- 网络能力范围限制 ----
+# ---- 网络能力范围 ----
+# 只允许 IPv4/IPv6 socket（挡掉 AF_NETLINK/AF_PACKET 等异常能力）；
+# 不设 IPAddressDeny/Allow，因为 Hysteria2 本身是代理，需要能连接任意出网目标，
+# 收紧这里会直接打断代理功能，不是这个服务该加的限制。
 RestrictAddressFamilies=AF_INET AF_INET6
 RestrictNamespaces=true
-LockPersonality=true
-MemoryDenyWriteExecute=true
 
-# ---- syscall 白名单(限制 syscall 范围) ----
+# ---- 系统调用白名单 ----
 SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources @mount @debug @cpu-emulation @obsolete @swap @raw-io
+SystemCallFilter=~@privileged @resources @mount @debug @cpu-emulation @obsolete @swap @reboot @raw-io
 SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 
-# ---- 日志:统一交给 journald,并做速率限制,防止异常刷屏把磁盘写满 ----
+# ---- 日志：交给 journald，限速防止刷屏把磁盘写满 ----
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=hysteria2
+SyslogIdentifier=${SERVICE_NAME}
 LogRateLimitIntervalSec=30s
 LogRateLimitBurst=1000
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    echo "📄 已生成 hysteria2.service(安全加固版,未自动安装)。安装/启用:"
-    echo "   sudo cp hysteria2.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now ${SERVICE_NAME}"
+    log "📄 已生成加固版 ${SERVICE_NAME}.service"
+    log "   说明：MemoryDenyWriteExecute 未启用（部分 Go 版本的运行时在个别内核上与其冲突导致启动失败，"
+    log "   如果你的系统能兼容，可以在 [Service] 段里手动加一行 MemoryDenyWriteExecute=true 进一步加固）。"
 }
 
-# ---------- 生成 journald 日志限额(全局,防止 journal 无限增长) ----------
-write_journald_dropin() {
-    mkdir -p journald-dropin
-    cat > journald-dropin/hysteria2.conf <<'EOF'
-# 建议安装到 /etc/systemd/journald.conf.d/hysteria2.conf 后:
-#   sudo systemctl restart systemd-journald
-[Journal]
-SystemMaxUse=200M
-SystemKeepFree=500M
-MaxRetentionSec=14day
-Compress=yes
-EOF
-    echo "📄 已生成 journald-dropin/hysteria2.conf(限制 journal 日志总量,默认低级别、由 journald 统一管理)。安装:"
-    echo "   sudo mkdir -p /etc/systemd/journald.conf.d && sudo cp journald-dropin/hysteria2.conf /etc/systemd/journald.conf.d/ && sudo systemctl restart systemd-journald"
-}
-
-# ---------- 生成带健康检查/回滚的更新脚本 ----------
-write_update_script() {
-    cat > hysteria2-update.sh <<UPEOF
-#!/usr/bin/env bash
-set -uo pipefail
-SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
-cd "\$SCRIPT_DIR"
-
-LOCK_FILE="/tmp/${SERVICE_NAME}-update.lock"
-SERVICE="${SERVICE_NAME}"
-BACKUP_DIR="./backup"
-
-# 更新加锁,避免 cron/手动同时触发导致并发执行互相踩踏
-exec 200>"\$LOCK_FILE"
-if ! flock -n 200; then
-    echo "❌ 已有更新任务在执行,本次退出。"
-    exit 1
-fi
-
-echo "🔄 [\$(date '+%F %T')] 开始检查更新..."
-
-CUR_BIN=\$(ls hysteria-linux-* 2>/dev/null | head -n1 || true)
-if [[ -z "\$CUR_BIN" ]]; then
-    echo "❌ 未找到当前二进制,无法更新"
-    exit 1
-fi
-
-mkdir -p "\$BACKUP_DIR"
-cp -f "\$CUR_BIN" "\$BACKUP_DIR/\${CUR_BIN}.bak"
-cp -f server.yaml "\$BACKUP_DIR/server.yaml.bak" 2>/dev/null || true
-
-# ---- 更新前健康检查:当前服务是否正常运行 ----
-if systemctl is-active --quiet "\$SERVICE" 2>/dev/null; then
-    echo "✅ 更新前健康检查通过:当前服务运行正常"
-else
-    echo "⚠️ 更新前健康检查:当前服务未在运行(仍继续更新流程)"
-fi
-
-# ---- 下载并校验新版本(复用主脚本逻辑,不新起一份下载代码) ----
-if ! bash "\${SCRIPT_DIR}/hysteria2.sh" --update-only; then
-    echo "❌ 更新下载/校验失败,未做任何变更,当前版本继续运行"
-    exit 1
-fi
-
-# ---- 重启并做启动后健康检查,失败自动回滚 ----
-systemctl restart "\$SERVICE"
-sleep 3
-
-if systemctl is-active --quiet "\$SERVICE"; then
-    echo "✅ [\$(date '+%F %T')] 更新完成,服务运行正常。"
-    rm -rf "\${BACKUP_DIR:?}"/*
-    exit 0
-fi
-
-echo "❌ 新版本启动失败,3 秒后自动回滚到更新前版本..."
-cp -f "\$BACKUP_DIR/\${CUR_BIN}.bak" "\$CUR_BIN"
-cp -f "\$BACKUP_DIR/server.yaml.bak" server.yaml 2>/dev/null || true
-chmod +x "\$CUR_BIN"
-systemctl restart "\$SERVICE"
-sleep 2
-
-if systemctl is-active --quiet "\$SERVICE"; then
-    echo "✅ 已回滚到更新前版本,服务恢复正常。"
-    exit 1
-else
-    echo "❌ 回滚后服务仍无法启动,请手动检查: journalctl -u \${SERVICE} -n 50 --no-pager"
-    exit 1
-fi
-UPEOF
-    chmod +x hysteria2-update.sh
-    echo "📄 已生成 hysteria2-update.sh(更新前健康检查 + 更新后校验 + 失败自动回滚 + 加锁防并发)。"
-    echo "   可配 systemd timer 或 cron 定期执行,例如每天凌晨: 0 4 * * * ${SCRIPT_DIR}/hysteria2-update.sh >> ${SCRIPT_DIR}/update.log 2>&1"
-}
-
-# ---------- 打印连接信息 ----------
 print_connection_info() {
     local IP="$1"
-    echo "🎉 Hysteria2 部署成功!"
+    echo "🎉 Hysteria2 部署成功！"
     echo "=========================================================================="
     echo "📋 服务器信息:"
     echo "   🌐 IP地址: $IP"
     echo "   🔌 端口(UDP): $SERVER_PORT"
     echo "   🔑 密码: $AUTH_PASSWORD  (已保存于 $PASSWORD_FILE)"
     echo "   🔏 证书 pinSHA256: $PIN_SHA256"
-    echo "   🧠 GOMEMLIMIT: $MEMORY_LIMIT(可用 GOMEMLIMIT=xxx 环境变量覆盖)"
+    echo "   👤 运行账号: $RUN_USER（非 root，权限已隔离）"
     echo ""
-    echo "📱 节点链接(SNI 仅用于 TLS 握手,连接安全性由 pinSHA256 证书指纹保证):"
+    echo "📱 节点链接（hysteria2 官方客户端 / NekoBox 等支持 pinSHA256 的客户端用这个）:"
     echo "hysteria2://${AUTH_PASSWORD}@${IP}:${SERVER_PORT}?sni=${SNI}&alpn=${ALPN}&pinSHA256=${PIN_SHA256}#Hy2"
     echo ""
-    echo "📄 客户端配置文件:"
-    echo "server: ${IP}:${SERVER_PORT}"
-    echo "auth: ${AUTH_PASSWORD}"
-    echo "tls:"
-    echo "  sni: ${SNI}"
-    echo "  alpn: [\"${ALPN}\"]"
-    echo "  pinSHA256: \"${PIN_SHA256}\""
-    echo "socks5:"
-    echo "  listen: 127.0.0.1:1080"
-    echo "http:"
-    echo "  listen: 127.0.0.1:8080"
+    echo "📱 sing-box outbound 配置（自签证书，必须 insecure:true，直接复制进 config.json）:"
+    cat <<SINGBOX
+{
+  "type": "hysteria2",
+  "tag": "hy2-out",
+  "server": "${IP}",
+  "server_port": ${SERVER_PORT},
+  "password": "${AUTH_PASSWORD}",
+  "tls": {
+    "enabled": true,
+    "server_name": "${SNI}",
+    "insecure": true,
+    "alpn": ["${ALPN}"]
+  }
+}
+SINGBOX
+    echo ""
+    echo "   ⚠️ sing-box 不支持 pinSHA256 证书指纹校验，只能靠 insecure:true 跳过证书链校验，"
+    echo "   这不是降低安全性的额外妥协——自签证书场景下 sing-box 本来就只能这样连，正常现象。"
     echo "=========================================================================="
-    echo "⚠️ 排查"连接不通"请按顺序检查:"
-    echo "   1) systemctl status ${SERVICE_NAME} —— 进程是否真的在跑"
-    echo "   2) journalctl -u ${SERVICE_NAME} -n 50 --no-pager —— 是否 preflight 就失败了"
-    echo "   3) ss -ulnp | grep ${SERVER_PORT} —— 本机是否真的在监听该 UDP 端口"
-    echo "   4) 本机防火墙(已尝试自动放行,见上面日志)"
-    echo "   5) 云厂商安全组/网络ACL(脚本无法代为操作,必须去控制台手动放行 UDP ${SERVER_PORT})"
-    echo "   6) 部分运营商/校园网会限制或屏蔽 UDP/QUIC,换个网络环境测试排除"
-    echo "=========================================================================="
-    echo "⚠️ 前台直接运行的进程会在 SSH 断开后被杀掉,长期挂机请安装 hysteria2.service:"
-    echo "   sudo cp hysteria2.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now ${SERVICE_NAME}"
+    echo "⚠️ Hysteria2 使用 UDP/QUIC 协议，请务必确认云厂商安全组已放行 UDP ${SERVER_PORT}"
+    echo "   （本机侧一切正常也可能因为云控制台安全组没放行而连不通，这一步只能去控制台手动查）。"
 }
 
-# ---------- 主逻辑 ----------
+# ---------- 启动后自检：真正确认服务活着、端口在听，而不是“exec 了就当成功” ----------
+post_start_healthcheck() {
+    local tries=10
+    log "🔎 正在校验服务是否真正启动成功..."
+    for ((i=1; i<=tries; i++)); do
+        if systemctl is-active --quiet "$SERVICE_NAME" \
+           && ss -lun 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${SERVER_PORT}\$"; then
+            log "✅ 服务运行中，且 UDP ${SERVER_PORT} 正在监听。"
+            return 0
+        fi
+        sleep 1
+    done
+    err "❌ 服务启动后 ${tries} 秒内仍未监听端口，判定为启动失败。最近日志："
+    journalctl -u "$SERVICE_NAME" -n 30 --no-pager 2>/dev/null | sed 's/^/   /' >&2
+    return 1
+}
+
 main() {
     download_binary
-
-    if [[ "$UPDATE_ONLY" -eq 1 ]]; then
-        echo "✅ --update-only 模式:已完成下载与校验,退出(不改证书/配置/systemd,不启动)。"
-        exit 0
-    fi
-
     ensure_cert
     PIN_SHA256="$(compute_pin_sha256)"
     write_config
-    open_firewall_port "$SERVER_PORT"
+    ensure_run_user
     write_preflight_script
     write_systemd_unit
-    write_journald_dropin
-    write_update_script
-    SERVER_IP=$(get_server_ip)
-    print_connection_info "$SERVER_IP"
+    lock_down_permissions
 
-    echo ""
-    echo "🚀 即将前台启动 Hysteria2(仅用于验证配置是否正常;正式使用请安装上面的 systemd 服务)..."
-    echo "   若只是想验证,启动后另开一个终端执行: ss -ulnp | grep ${SERVER_PORT}"
-    export GOMEMLIMIT="$MEMORY_LIMIT"
-    ./hysteria2-preflight.sh || { echo "❌ 预检未通过,已取消启动,请根据上面的报错修复后重试。"; exit 1; }
-    exec "$BIN_PATH" server -c server.yaml
+    SERVER_IP=$(get_server_ip)
+
+    if [[ "$AUTO_INSTALL" == "1" && $EUID -eq 0 ]]; then
+        log "🚀 安装为 systemd 服务并常驻启动（AUTO_INSTALL=1，SSH 断开也不会掉线）..."
+        cp -f "${SCRIPT_DIR}/${SERVICE_NAME}.service" "/etc/systemd/system/${SERVICE_NAME}.service"
+        systemctl daemon-reload
+        systemctl enable --now "$SERVICE_NAME"
+        if post_start_healthcheck; then
+            print_connection_info "$SERVER_IP"
+        else
+            err "部署未成功，请查看上面的日志定位原因，或运行: bash $0 diagnose"
+            exit 1
+        fi
+    else
+        if [[ $EUID -ne 0 ]]; then
+            err "ℹ️ 当前非 root，无法自动安装 systemd 服务。已生成所有文件，请自行执行："
+            err "   sudo cp ${SERVICE_NAME}.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now ${SERVICE_NAME}"
+        else
+            log "ℹ️ AUTO_INSTALL=0，仅生成文件，不自动安装/启动。"
+        fi
+        print_connection_info "$SERVER_IP"
+    fi
 }
 
 main "$@"
