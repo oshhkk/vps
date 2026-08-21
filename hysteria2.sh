@@ -69,7 +69,10 @@ if [[ -n "${AUTH_PASSWORD:-}" ]]; then
     sanitize_password "$AUTH_PASSWORD"
     echo "✅ 使用环境变量指定的密码"
 elif [[ -f "$PASSWORD_FILE" ]]; then
-    AUTH_PASSWORD=$(cat "$PASSWORD_FILE")
+    # 用 tr 去掉首尾换行/回车:$(...) 本身只会去掉末尾的 \n,
+    # 如果文件是手动创建/在 Windows 下编辑过(CRLF),cat 会残留一个 \r 混进密码里,
+    # 进而污染 server.yaml 和 hysteria2:// 分享链接。
+    AUTH_PASSWORD=$(tr -d '\r\n' < "$PASSWORD_FILE")
     echo "✅ 检测到已保存的密码($PASSWORD_FILE),复用它以免重复运行时密码跟着变"
 else
     AUTH_PASSWORD=$(openssl rand -hex 16)   # hex 而非 base64:避免 +/= 之类的字符把下面的 hysteria2:// 分享链接解析错乱
@@ -112,6 +115,9 @@ detect_latest_version() {
         exit 1
     fi
     # 不依赖 jq：GitHub API 默认返回“每行一个字段”的美化 JSON，逐行匹配 tag_name / draft / prerelease
+    # 注意:apernet/hysteria 仓库同时会为 core/vX.Y.Z、extras/vX.Y.Z、app/vX.Y.Z 三个 Go
+    # 子模块各打一次同版本号的 tag,只有 app/ 这个才是带编译好二进制资产的正式发布,
+    # 所以这里必须精确匹配 app/ 前缀,不能放宽,否则可能选中 core/extras 的 tag 导致后面下载 404。
     version=$(printf '%s\n' "$json" | awk '
         /"tag_name":/   { gsub(/[",]/,""); split($0,a,": "); tag=a[2] }
         /"draft":/      { gsub(/[",]/,""); split($0,a,": "); draft=a[2] }
@@ -135,37 +141,46 @@ echo "✅ 最新稳定版本: ${HYSTERIA_VERSION}(release tag: ${HYSTERIA_VERSIO
 BIN_NAME="hysteria-linux-${ARCH}"
 BIN_PATH="./${BIN_NAME}"
 
-# ---------- 校验和验证(强制,取不到官方值就不允许启动未验证的二进制) ----------
+# ---------- 校验和验证 ----------
+# 只负责“计算并比对”,不做删除/退出等副作用;返回 0=通过,1=未通过,由调用方决定怎么处理。
 verify_checksum() {
     local hash_url="https://github.com/apernet/hysteria/releases/download/${HYSTERIA_VERSION_TAG}/hashes.txt"
     local hashes expected actual
     if ! hashes=$(curl -fsL --connect-timeout 10 --max-time 20 "$hash_url" 2>/dev/null); then
-        echo "❌ 未能获取官方 hashes.txt,无法验证二进制完整性,已删除文件并终止。"
-        rm -f "$BIN_PATH"
-        exit 1
+        echo "⚠️ 未能获取官方 hashes.txt(${HYSTERIA_VERSION_TAG}),无法验证二进制完整性。"
+        return 1
     fi
-    expected=$(printf '%s\n' "$hashes" | grep -E "[[:space:]]${BIN_NAME}\$" | awk '{print $1}' | head -n1)
+    # 官方 hashes.txt 里文件名带 "build/" 目录前缀(如 "build/hysteria-linux-amd64"),
+    # 因此用 awk 取路径最后一段(basename)做精确比较,而不是假设文件名前面直接是空白。
+    # 这样也不会和 hysteria-linux-amd64-avx 这类变体前缀撞在一起。
+    # 用 || true 兜底:awk 正常处理但没匹配到时本身退出码是 0,这里加只是防御性写法。
+    expected=$(printf '%s\n' "$hashes" | awk -v bin="$BIN_NAME" '
+        { n = split($NF, parts, "/"); if (parts[n] == bin) { print $1; exit } }
+    ' || true)
     if [[ -z "$expected" ]]; then
-        echo "❌ hashes.txt 里没有 ${BIN_NAME} 对应条目,无法验证,已删除文件并终止。"
-        rm -f "$BIN_PATH"
-        exit 1
+        echo "⚠️ hashes.txt(${HYSTERIA_VERSION_TAG})里没有 ${BIN_NAME} 对应条目,无法验证。"
+        return 1
     fi
     actual=$(sha256sum "$BIN_PATH" | awk '{print $1}')
     if [[ "$expected" == "$actual" ]]; then
         echo "✅ SHA256 校验通过,二进制完整可信。"
+        return 0
     else
-        echo "❌ SHA256 校验不匹配!期望 $expected,实际 $actual"
-        echo "❌ 文件可能损坏或被篡改,已删除并退出。"
-        rm -f "$BIN_PATH"
-        exit 1
+        echo "⚠️ SHA256 不匹配(期望 $expected,实际 $actual),与当前最新版(${HYSTERIA_VERSION_TAG})不一致。"
+        return 1
     fi
 }
 
 # ---------- 下载二进制 ----------
 download_binary() {
     if [ -f "$BIN_PATH" ]; then
-        echo "✅ 二进制已存在,跳过下载(不重复校验;如需强制刷新到最新版,请先删除 $BIN_PATH)。"
-        return
+        echo "🔍 发现已存在的二进制 $BIN_PATH,先校验完整性(对照当前最新版 ${HYSTERIA_VERSION_TAG})..."
+        if verify_checksum; then
+            echo "✅ 校验通过,复用已存在的二进制,跳过下载。"
+            return
+        fi
+        echo "ℹ️ 该文件可能是旧版本、已损坏或被篡改,将重新下载最新版本覆盖它。"
+        rm -f "$BIN_PATH"
     fi
     local url="https://github.com/apernet/hysteria/releases/download/${HYSTERIA_VERSION_TAG}/${BIN_NAME}"
     echo "⏳ 下载: $url"
@@ -176,7 +191,11 @@ download_binary() {
     fi
     chmod +x "$BIN_PATH"
     echo "✅ 下载完成并设置可执行: $BIN_PATH"
-    verify_checksum
+    if ! verify_checksum; then
+        echo "❌ 文件可能损坏或被篡改(或校验信息不可获取),已删除并终止(不允许启动未验证的二进制)。"
+        rm -f "$BIN_PATH"
+        exit 1
+    fi
 }
 
 # ---------- 生成自签证书(cert/key 必须成对管理) ----------
@@ -198,6 +217,9 @@ ensure_cert() {
 }
 
 # ---------- 计算证书 pinSHA256 指纹 ----------
+# 注意:Hysteria2 的 pinSHA256 校验的是叶子证书本身的整体指纹(openssl x509 -fingerprint),
+# 不是 SPKI/公钥指纹(那是 HPKP/移动端证书钉扎常用的另一种方案,数值完全不同、不通用)。
+# 官方文档与代码行为均以整证书指纹为准,这里维持原实现,不要改成 SPKI 算法。
 compute_pin_sha256() {
     local fp
     fp=$(openssl x509 -in "$CERT_FILE" -noout -fingerprint -sha256 2>/dev/null | sed -E 's/^.*Fingerprint=//')
@@ -239,6 +261,7 @@ quic:
   initConnReceiveWindow: 327680
   maxConnReceiveWindow: 655360
 EOF
+    chmod 600 server.yaml   # 该文件明文包含 AUTH_PASSWORD,权限需要和 auth.pass/key.pem 一致
 
     if ! grep -q '^listen:' server.yaml || ! grep -q '^auth:' server.yaml; then
         echo "❌ 配置文件生成异常(缺少关键字段),已终止,不会启动服务。"
@@ -247,12 +270,26 @@ EOF
     echo "✅ 写入配置 server.yaml(端口=${SERVER_PORT}, SNI=${SNI}[仅 TLS SNI], ALPN=${ALPN})。"
 }
 
-# ---------- 获取服务器 IP ----------
+# ---------- 获取服务器公网 IP ----------
+# 优先用外部探测服务而不是本机网卡地址(hostname -I):绝大多数云服务器(阿里云/腾讯云/AWS 等)
+# 网卡上看到的是内网/私有 IP,真正对外的公网 IP 必须靠外部服务回显才能拿到,
+# 直接信本机网卡地址在 NAT 环境下会把内网 IP 当成公网 IP 塞进分享链接,导致客户端连不上。
+# hostname -I 仅在两个外部服务都不可用时,作为“尽力而为”的最后兜底,并明确提示可能不准确。
 get_server_ip() {
-    local ip
+    local ip local_ip
     ip=$(curl -fsL --max-time 8 https://api.ipify.org 2>/dev/null) \
         || ip=$(curl -fsL --max-time 8 https://ifconfig.me 2>/dev/null) \
-        || ip="YOUR_SERVER_IP"
+        || ip=""
+    if [[ -z "$ip" ]]; then
+        local_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+        if [[ -n "$local_ip" ]]; then
+            echo "⚠️ 无法访问外部 IP 探测服务,回退使用本机网卡地址 $local_ip" >&2
+            echo "⚠️ 如果服务器在 NAT/内网环境(多数云主机默认如此),这可能不是公网可达地址,请手动核实实际公网 IP。" >&2
+            ip="$local_ip"
+        else
+            ip="YOUR_SERVER_IP"
+        fi
+    fi
     echo "$ip"
 }
 
