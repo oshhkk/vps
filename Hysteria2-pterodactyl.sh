@@ -191,7 +191,7 @@ ensure_acme_cert() {
             || { err "下载 acme.sh 源码失败"; exit 1; }
         tar -xzf /tmp/acme_src.tar.gz -C "$acme_src" --strip-components=1 \
             || { err "解压 acme.sh 源码失败"; exit 1; }
-        if ! bash "${acme_src}/acme.sh" --install --home "$ACME_HOME" > /tmp/acme_install.log 2>&1; then
+        if ! bash "${acme_src}/acme.sh" --install --home "$ACME_HOME" --force > /tmp/acme_install.log 2>&1; then
             err "acme.sh 安装失败，日志如下："
             cat /tmp/acme_install.log >&2
             exit 1
