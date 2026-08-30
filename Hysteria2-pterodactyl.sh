@@ -135,12 +135,26 @@ download_binary() {
 }
 
 # ---------- 证书：域名 ACME（按上面说明默认落盘）或自签 ----------
+CONFIG_ENV_FILE="cf.env"
+
+# 优先从本地配置文件读取域名/凭据 —— 这是最可靠的方式：Pterodactyl 面板 console 的 stdin
+# 是否能正确转发给手动跑起来的子进程并不保证（实测两次交互式 read 都没等到输入，大概率是
+# 这条链路没打通或被上层吞掉了），文件读取不依赖这条链路，同时也不会像命令行传参那样把
+# Token 留在 console 历史记录里。
+if [[ -f "$CONFIG_ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_ENV_FILE"
+    log "已从 ${CONFIG_ENV_FILE} 读取配置"
+fi
+
 prompt_domain() {
     [[ -n "${DOMAIN:-}" ]] && { echo "$DOMAIN"; return; }
     [[ -f "$DOMAIN_FILE" && "$EPHEMERAL_CERT" != "1" ]] && { cat "$DOMAIN_FILE"; return; }
     local _d
-    err "等待输入域名，30 秒内不输入则回退自签证书（也可用 DOMAIN=你的域名 bash $0 跳过等待）："
-    if read -rp "域名: " -t 30 _d; then
+    err "未找到 ${CONFIG_ENV_FILE}，也没有传 DOMAIN 环境变量。"
+    err "等待控制台输入域名，180 秒超时（如果一直卡住/没反应，说明这条 console 转发不通，"
+    err "改用 ${CONFIG_ENV_FILE} 文件方式最可靠，见上一条回复里的说明）："
+    if read -rp "域名: " -t 180 _d; then
         echo "$_d"
     else
         err "超时未收到输入，回退到自签证书。"
@@ -163,9 +177,10 @@ ensure_acme_cert() {
     # CF_Token 只在这一次进程里用来签发证书，签发后 acme.sh 会把它存进自己的 $ACME_HOME 目录
     # （这是 acme.sh 自身续期机制的必要条件，不是本脚本额外加的持久化），本脚本不再单独存一份副本。
     if [[ -z "${CF_Token:-}" ]]; then
-        read -rp "Cloudflare API Token: " -t 60 -s CF_Token || { err "超时未收到 Token，终止。"; exit 1; }
+        err "等待控制台输入 Cloudflare Token/Zone ID，180 秒超时（同样建议改用 ${CONFIG_ENV_FILE} 文件）："
+        read -rp "Cloudflare API Token: " -t 180 -s CF_Token || { err "超时未收到 Token，终止。"; exit 1; }
         echo
-        read -rp "Zone ID: " -t 30 CF_Zone_ID || { err "超时未收到 Zone ID，终止。"; exit 1; }
+        read -rp "Zone ID: " -t 60 CF_Zone_ID || { err "超时未收到 Zone ID，终止。"; exit 1; }
     fi
     export CF_Token CF_Zone_ID
 
