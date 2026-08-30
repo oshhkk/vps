@@ -4,7 +4,8 @@
 #       bash hysteria2.sh diagnose   诊断
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
 cd "$SCRIPT_DIR"
 export HOME="${SCRIPT_DIR}/.home"
 mkdir -p "$HOME"
@@ -141,9 +142,19 @@ CONFIG_ENV_FILE="cf.env"
 # 是否能正确转发给手动跑起来的子进程并不保证（实测两次交互式 read 都没等到输入，大概率是
 # 这条链路没打通或被上层吞掉了），文件读取不依赖这条链路，同时也不会像命令行传参那样把
 # Token 留在 console 历史记录里。
+# 只挑出这三个变量对应的 KEY=VALUE 行，其他内容一律忽略 —— 不用 source，
+# 避免文件里混入其他文字（比如误粘贴的 URL/命令）被当成 shell 命令执行。
 if [[ -f "$CONFIG_ENV_FILE" ]]; then
-    # shellcheck disable=SC1090
-    source "$CONFIG_ENV_FILE"
+    while IFS='=' read -r _k _v; do
+        _v="${_v%$'\r'}"                    # 去掉可能的 CRLF 残留
+        _v="${_v%\"}"; _v="${_v#\"}"        # 去掉包住的双引号（如果有）
+        _v="${_v%\'}"; _v="${_v#\'}"        # 去掉包住的单引号（如果有）
+        case "$_k" in
+            DOMAIN)     DOMAIN="$_v" ;;
+            CF_Token)   CF_Token="$_v" ;;
+            CF_Zone_ID) CF_Zone_ID="$_v" ;;
+        esac
+    done < <(grep -E '^(DOMAIN|CF_Token|CF_Zone_ID)=' "$CONFIG_ENV_FILE")
     log "已从 ${CONFIG_ENV_FILE} 读取配置"
 fi
 
@@ -169,9 +180,17 @@ ensure_acme_cert() {
     fi
 
     if [[ ! -x "${ACME_HOME}/acme.sh" ]]; then
-        curl -fsSL https://get.acme.sh -o /tmp/acme_install.sh
-        sh /tmp/acme_install.sh --home "$ACME_HOME" --nocron --accountemail "admin@${domain}" >/dev/null 2>&1 \
-            || { err "acme.sh 安装失败"; exit 1; }
+        curl -fsSL https://get.acme.sh -o /tmp/acme_install.sh || { err "下载 acme.sh 安装脚本失败"; exit 1; }
+        if ! sh /tmp/acme_install.sh --home "$ACME_HOME" --nocron --accountemail "admin@${domain}" > /tmp/acme_install.log 2>&1; then
+            err "acme.sh 安装失败，日志如下："
+            cat /tmp/acme_install.log >&2
+            exit 1
+        fi
+        if [[ ! -x "${ACME_HOME}/acme.sh" ]]; then
+            err "acme.sh 安装脚本执行完了，但没有生成 ${ACME_HOME}/acme.sh，日志如下："
+            cat /tmp/acme_install.log >&2
+            exit 1
+        fi
     fi
 
     # CF_Token 只在这一次进程里用来签发证书，签发后 acme.sh 会把它存进自己的 $ACME_HOME 目录
