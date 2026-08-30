@@ -28,7 +28,7 @@ MODE="deploy"
 
 check_deps() {
     local missing=()
-    for bin in curl openssl sha256sum grep sed awk uname ss; do
+    for bin in curl openssl sha256sum grep sed awk uname ss tar; do
         command -v "$bin" >/dev/null 2>&1 || missing+=("$bin")
     done
     [[ "${#missing[@]}" -eq 0 ]] || { err "缺少依赖: ${missing[*]}"; exit 1; }
@@ -180,12 +180,18 @@ ensure_acme_cert() {
     fi
 
     if [[ ! -x "${ACME_HOME}/acme.sh" ]]; then
-        curl -fsSL https://get.acme.sh -o /tmp/acme_install.sh || { err "下载 acme.sh 安装脚本失败"; exit 1; }
-        # 不传任何 --home/--nocron 之类的参数：get.acme.sh 自身有个已知 bug，
-        # 重装流程会把已带 -- 的参数再加一次前缀，变成 ----home 这种乱码导致解析失败。
-        # $HOME 已经在脚本开头被重定向到脚本目录下，acme.sh 默认就会装在 $HOME/.acme.sh，
-        # 不需要显式传 --home；没有 crontab 只会打个提示，不影响安装。
-        if ! bash /tmp/acme_install.sh > /tmp/acme_install.log 2>&1; then
+        # get.acme.sh 这个小型安装脚本自身有已知 bug：它会去下载完整源码包解压、
+        # 再重新调用一次自己，这个重新调用的内部逻辑会把参数多加一次 -- 前缀导致解析失败
+        # （跟我们传不传参数无关，是它自身的问题）。绕过办法：直接下载完整源码包解压后
+        # 用完整版的 acme.sh 自己的 --install 命令装，完整版不需要再"上网下载解压重启自己"，
+        # 就不会走到那段有 bug 的代码。
+        local acme_src="/tmp/acme.sh.src"
+        rm -rf "$acme_src"; mkdir -p "$acme_src"
+        curl -fsSL https://github.com/acmesh-official/acme.sh/archive/master.tar.gz -o /tmp/acme_src.tar.gz \
+            || { err "下载 acme.sh 源码失败"; exit 1; }
+        tar -xzf /tmp/acme_src.tar.gz -C "$acme_src" --strip-components=1 \
+            || { err "解压 acme.sh 源码失败"; exit 1; }
+        if ! bash "${acme_src}/acme.sh" --install --home "$ACME_HOME" > /tmp/acme_install.log 2>&1; then
             err "acme.sh 安装失败，日志如下："
             cat /tmp/acme_install.log >&2
             exit 1
