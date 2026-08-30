@@ -17,7 +17,7 @@ ALPN="h3"
 MEMORY_LIMIT="${GOMEMLIMIT:-70MiB}"
 GITHUB_REPO="apernet/hysteria"
 LOG_LEVEL="${HYSTERIA_LOG_LEVEL:-warn}"
-ACME_HOME="${SCRIPT_DIR}/.acme.sh"
+ACME_HOME="${HOME}/.acme.sh"
 EPHEMERAL_CERT="${EPHEMERAL_CERT:-0}"   # 1=不保留证书，每次重新签发(会撞 Let's Encrypt 限流，不建议)
 
 log() { echo "$@"; }
@@ -181,7 +181,11 @@ ensure_acme_cert() {
 
     if [[ ! -x "${ACME_HOME}/acme.sh" ]]; then
         curl -fsSL https://get.acme.sh -o /tmp/acme_install.sh || { err "下载 acme.sh 安装脚本失败"; exit 1; }
-        if ! bash /tmp/acme_install.sh --home "$ACME_HOME" --nocron --accountemail "admin@${domain}" > /tmp/acme_install.log 2>&1; then
+        # 不传任何 --home/--nocron 之类的参数：get.acme.sh 自身有个已知 bug，
+        # 重装流程会把已带 -- 的参数再加一次前缀，变成 ----home 这种乱码导致解析失败。
+        # $HOME 已经在脚本开头被重定向到脚本目录下，acme.sh 默认就会装在 $HOME/.acme.sh，
+        # 不需要显式传 --home；没有 crontab 只会打个提示，不影响安装。
+        if ! bash /tmp/acme_install.sh > /tmp/acme_install.log 2>&1; then
             err "acme.sh 安装失败，日志如下："
             cat /tmp/acme_install.log >&2
             exit 1
@@ -203,11 +207,11 @@ ensure_acme_cert() {
     fi
     export CF_Token CF_Zone_ID
 
-    "${ACME_HOME}/acme.sh" --home "$ACME_HOME" --issue --dns dns_cf -d "$domain" \
+    "${ACME_HOME}/acme.sh" --issue --dns dns_cf -d "$domain" \
         --keylength ec-256 --server letsencrypt \
         || { err "证书申请失败，检查域名是否由该 Cloudflare 账号管理、Token 是否有 Zone:DNS:Edit 权限"; exit 1; }
 
-    "${ACME_HOME}/acme.sh" --home "$ACME_HOME" --install-cert -d "$domain" --ecc \
+    "${ACME_HOME}/acme.sh" --install-cert -d "$domain" --ecc \
         --key-file "${SCRIPT_DIR}/${KEY_FILE}" --fullchain-file "${SCRIPT_DIR}/${CERT_FILE}" \
         || { err "证书安装失败"; exit 1; }
 
