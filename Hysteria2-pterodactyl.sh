@@ -181,7 +181,7 @@ ensure_acme_cert() {
 
     if [[ ! -x "${ACME_HOME}/acme.sh" ]]; then
         curl -fsSL https://get.acme.sh -o /tmp/acme_install.sh || { err "下载 acme.sh 安装脚本失败"; exit 1; }
-        if ! sh /tmp/acme_install.sh --home "$ACME_HOME" --nocron --accountemail "admin@${domain}" > /tmp/acme_install.log 2>&1; then
+        if ! bash /tmp/acme_install.sh --home "$ACME_HOME" --nocron --accountemail "admin@${domain}" > /tmp/acme_install.log 2>&1; then
             err "acme.sh 安装失败，日志如下："
             cat /tmp/acme_install.log >&2
             exit 1
